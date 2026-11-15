@@ -1,122 +1,131 @@
-#include <stdio.h>
-#include <stdbool.h>
 
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
 #include "esp_err.h"
 #include "esp_adc/adc_oneshot.h"
-#include "driver/gpio.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
 
-// TASK 1: Pin configuration
-#define LDR_CHANNEL ADC_CHANNEL_0
-#define LED_PIN GPIO_NUM_15
+// ADC configuration
+#define ADC_CHANNEL ADC_CHANNEL_0
+#define ADC_ATTEN ADC_ATTEN_DB_12
+#define ADC_BITWIDTH ADC_BITWIDTH_12
 
-// TASK 2: SMA configuration
-#define SMA_WINDOW_SIZE 10
+#define READ_INTERVAL_MS 500
+#define MEASUREMENTS_COUNT 10000
 
-// TASK 3: Hysteresis thresholds
-#define DARK_THRESHOLD 1200
-#define LIGHT_THRESHOLD 1800
-
-#define SAMPLE_INTERVAL_MS 200
+#define ADC_MAX_VALUE 4095.0f
+#define ADC_REFERENCE_MV 3300.0f
 
 void app_main(void)
 {
-    // TASK 1: ADC oneshot initialization
+    // 1. Initialize ADC1
     adc_oneshot_unit_handle_t adc_handle;
 
-    adc_oneshot_unit_init_cfg_t adc_config = {
+    adc_oneshot_unit_init_cfg_t unit_config = {
         .unit_id = ADC_UNIT_1,
     };
 
     ESP_ERROR_CHECK(
-        adc_oneshot_new_unit(&adc_config, &adc_handle)
+        adc_oneshot_new_unit(&unit_config, &adc_handle)
     );
 
+    // 2. Configure ADC channel
     adc_oneshot_chan_cfg_t channel_config = {
-        .bitwidth = ADC_BITWIDTH_12,
-        .atten = ADC_ATTEN_DB_12,
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH,
     };
 
     ESP_ERROR_CHECK(
         adc_oneshot_config_channel(
             adc_handle,
-            LDR_CHANNEL,
+            ADC_CHANNEL,
             &channel_config
         )
     );
 
-    // TASK 1: LED initialization
-    ESP_ERROR_CHECK(gpio_reset_pin(LED_PIN));
-    ESP_ERROR_CHECK(gpio_set_direction(LED_PIN, GPIO_MODE_OUTPUT));
-    ESP_ERROR_CHECK(gpio_set_level(LED_PIN, 0));
+    // 3. Initialize ADC calibration
+    adc_cali_handle_t cali_handle;
 
-    // TASK 2: SMA buffer initialization
-    int samples[SMA_WINDOW_SIZE] = {0};
-    int sample_index = 0;
-    int sample_count = 0;
-    int sum = 0;
+    adc_cali_curve_fitting_config_t cali_config = {
+        .unit_id = ADC_UNIT_1,
+        .chan = ADC_CHANNEL,
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH,
+    };
 
-    // TASK 3: LED state
-    bool led_state = false;
+    ESP_ERROR_CHECK(
+        adc_cali_create_scheme_curve_fitting(
+            &cali_config,
+            &cali_handle
+        )
+    );
 
-    printf("LDR + SMA + Hysteresis started\n");
+    // 4. Print measurement table
+    printf("\n");
+    printf("RAW\tU_manual(mV)\tU_cali(mV)\tError(%%)\n");
+    printf("------------------------------------------------\n");
 
-    while (1)
-    {
-        // TASK 1: Read ADC value
-        int adc_value = 0;
+    // 5. Perform multiple measurements
+    for (int i = 0; i < MEASUREMENTS_COUNT; i++) {
 
+        int raw_value = 0;
+        int calibrated_voltage = 0;
+
+        // Read RAW ADC value
         ESP_ERROR_CHECK(
             adc_oneshot_read(
                 adc_handle,
-                LDR_CHANNEL,
-                &adc_value
+                ADC_CHANNEL,
+                &raw_value
             )
         );
 
-        // TASK 2: Update SMA buffer
-        if (sample_count == SMA_WINDOW_SIZE)
-        {
-            sum -= samples[sample_index];
-        }
-        else
-        {
-            sample_count++;
-        }
+        // Calculate voltage manually
+        float manual_voltage =
+            (raw_value / ADC_MAX_VALUE) * ADC_REFERENCE_MV;
 
-        samples[sample_index] = adc_value;
-        sum += adc_value;
-
-        sample_index = (sample_index + 1) % SMA_WINDOW_SIZE;
-
-        // TASK 2: Calculate SMA
-        int sma_value = sum / sample_count;
-
-        // TASK 3: Hysteresis control
-        if (sma_value < DARK_THRESHOLD)
-        {
-            led_state = true;
-        }
-        else if (sma_value > LIGHT_THRESHOLD)
-        {
-            led_state = false;
-        }
-
-        // TASK 3: Update LED
+        // Read calibrated voltage
         ESP_ERROR_CHECK(
-            gpio_set_level(LED_PIN, led_state)
+            adc_cali_raw_to_voltage(
+                cali_handle,
+                raw_value,
+                &calibrated_voltage
+            )
         );
 
-        // TASK 4: Print measurements
+        // Calculate error percentage
+        float difference = manual_voltage - calibrated_voltage;
+
+        if (difference < 0) {
+            difference = -difference;
+        }
+
+        float error = 0;
+
+        if (calibrated_voltage != 0) {
+            error = (difference / calibrated_voltage) * 100.0f;
+        }
+
+        // Print measurement
         printf(
-            "ADC: %d | SMA: %d | LED: %s\n",
-            adc_value,
-            sma_value,
-            led_state ? "ON" : "OFF"
+            "%d\t%.1f\t\t%d\t\t%.2f\n",
+            raw_value,
+            manual_voltage,
+            calibrated_voltage,
+            error
         );
 
-        vTaskDelay(pdMS_TO_TICKS(SAMPLE_INTERVAL_MS));
+        vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
     }
+
+    // 6. Delete calibration resources
+    ESP_ERROR_CHECK(
+        adc_cali_delete_scheme_curve_fitting(cali_handle)
+    );
+
+    ESP_ERROR_CHECK(
+        adc_oneshot_del_unit(adc_handle)
+    );
 }
